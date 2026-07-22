@@ -5785,6 +5785,73 @@ static NSDictionary *handleCheckTypingStatus(NSInteger requestId, NSDictionary *
     return successResponse(requestId, @{@"chatGuid": chatGuid, @"typing": @(typing)});
 }
 
+/// `focus-status`: report whether the remote party has a Focus / Do Not Disturb
+/// status we're allowed to see. Pure read — no message traffic, no side effects.
+/// Lets a caller avoid double-texting into a silenced thread and calibrate how
+/// long a reply should be expected to take.
+///
+/// `authorized` / `supportsFocusMode` are synchronous. `canShare` and `invited`
+/// are completion-handler based; we wait briefly and report `null` on timeout
+/// rather than blocking the RPC thread indefinitely.
+static NSDictionary *handleFocusStatus(NSInteger requestId, NSDictionary *params) {
+    NSString *chatGuid = params[@"chatGuid"];
+    if (!chatGuid.length) return errorResponse(requestId, @"Missing chatGuid");
+    IMChat *chat = resolveChatByGuid(chatGuid);
+    if (!chat) return errorResponse(requestId, @"Chat not found");
+
+    BOOL authorized = NO, supportsFocus = NO;
+    if ([chat respondsToSelector:@selector(isMessagesAuthorizedToAccessFocusStatus)]) {
+        authorized = ((BOOL (*)(id, SEL))objc_msgSend)(
+            chat, @selector(isMessagesAuthorizedToAccessFocusStatus));
+    }
+    if ([chat respondsToSelector:@selector(_supportsFocusMode)]) {
+        supportsFocus = ((BOOL (*)(id, SEL))objc_msgSend)(chat, @selector(_supportsFocusMode));
+    }
+
+    // Async pair: bounded wait so a hung completion can't wedge the RPC thread.
+    __block NSNumber *canShare = nil;
+    __block NSNumber *invited = nil;
+    dispatch_semaphore_t sem = dispatch_semaphore_create(0);
+    if ([chat respondsToSelector:@selector(canShareFocusStatusWithCompletion:)]) {
+        @try {
+            ((void (*)(id, SEL, void (^)(BOOL)))objc_msgSend)(
+                chat, @selector(canShareFocusStatusWithCompletion:), ^(BOOL v) {
+                    canShare = @(v);
+                    dispatch_semaphore_signal(sem);
+                });
+            dispatch_semaphore_wait(sem,
+                dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)));
+        } @catch (NSException *ex) {
+            debugLog(@"handleFocusStatus: canShare exception=%@", ex.reason);
+        }
+    }
+    dispatch_semaphore_t sem2 = dispatch_semaphore_create(0);
+    if ([chat respondsToSelector:@selector(isInvitedToViewMyFocusStatusWithCompletion:)]) {
+        @try {
+            ((void (*)(id, SEL, void (^)(BOOL)))objc_msgSend)(
+                chat, @selector(isInvitedToViewMyFocusStatusWithCompletion:), ^(BOOL v) {
+                    invited = @(v);
+                    dispatch_semaphore_signal(sem2);
+                });
+            dispatch_semaphore_wait(sem2,
+                dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)));
+        } @catch (NSException *ex) {
+            debugLog(@"handleFocusStatus: invited exception=%@", ex.reason);
+        }
+    }
+
+    debugLog(@"handleFocusStatus: guid=%@ authorized=%d supportsFocus=%d canShare=%@ invited=%@",
+             chatGuid, authorized, supportsFocus, canShare ?: @"nil", invited ?: @"nil");
+
+    return successResponse(requestId, @{
+        @"chatGuid": chatGuid,
+        @"authorized": @(authorized),
+        @"supportsFocusMode": @(supportsFocus),
+        @"canShareFocusStatus": canShare ?: [NSNull null],
+        @"invitedToViewMyFocusStatus": invited ?: [NSNull null]
+    });
+}
+
 static NSDictionary *handleMarkChatRead(NSInteger requestId, NSDictionary *params) {
     NSString *chatGuid = params[@"chatGuid"];
     NSString *handle = params[@"handle"];
@@ -6523,6 +6590,7 @@ static NSDictionary* dispatchAction(NSInteger legacyId, NSString *action,
     if ([action isEqualToString:@"start-typing"]) return handleStartTyping(legacyId, params);
     if ([action isEqualToString:@"stop-typing"]) return handleStopTyping(legacyId, params);
     if ([action isEqualToString:@"check-typing-status"]) return handleCheckTypingStatus(legacyId, params);
+    if ([action isEqualToString:@"focus-status"]) return handleFocusStatus(legacyId, params);
     if ([action isEqualToString:@"mark-chat-read"]) return handleMarkChatRead(legacyId, params);
     if ([action isEqualToString:@"mark-chat-unread"]) return handleMarkChatUnread(legacyId, params);
     if ([action isEqualToString:@"add-participant"]) return handleAddParticipant(legacyId, params);
